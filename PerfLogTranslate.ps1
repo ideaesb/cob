@@ -27,7 +27,7 @@
 #                                                                             #
 ###############################################################################
 
-$debugMode = $false
+$debugMode = $true
 $perfLogTranslateExe = "C:\Users\ukari\Downloads\PerfLogTranslate.exe"
 
 ###############################################################################
@@ -50,8 +50,7 @@ $csvOutputFolder  = "signalControllerLogsCsv"
 if (Test-Path -Path $controllerLogs) {
 
   ############################################################################################
-  #  Per https://stackoverflow.com/questions/16906170/create-directory-if-it-does-not-exist
-  #  
+  #   
   #  Create local csvOutputFolder  (creating one if it does not already exist)
 
   # Combine Present Working Directory (PWD) to create the full subdirectory path to csvFolder
@@ -69,25 +68,25 @@ if (Test-Path -Path $controllerLogs) {
   Get-ChildItem -Path $controllerLogs -Directory | ForEach-Object {
 
     # give the child a meaningful variable name
-    $signalFolder = $_
-    $signalName = Split-Path -Path $signalFolder -Leaf
+    $signalLogsFolder = $_.FullName
+    $signalName = Split-Path -Path $signalLogsFolder -Leaf
 
-    if ($debugMode) { Write-Host "Processing directory (Full Name) " $signalFolder }
+    if ($debugMode) { Write-Host "Processing directory (Full Name) " $signalLogsFolder  }
     if ($debugMode) { Write-Host "Processing directory:" $signalName }
     
     
     # Create the folder if it does not already exist
     # By end of the loop, CSV directory will, as a result, mirror the controller logs directory
-    $signalFolder = [System.IO.Path]::Combine($csvDirPath, $signalName)  
-    [System.IO.Directory]::CreateDirectory($signalFolder) | Out-Null
-    if ($debugMode) { Write-Host "Created Signal Folder :" $signalFolder }
+    $signalCsvFolder = [System.IO.Path]::Combine($csvDirPath, $signalName)  
+    [System.IO.Directory]::CreateDirectory($signalCsvFolder) | Out-Null
+    if ($debugMode) { Write-Host "Created Signal Folder :" $signalCsvFolder }
     
     # iterate through the data directory in signal folder of controller logs
-    $dataFolder = [System.IO.Path]::Combine($signalFolder, "data")
+    $dataFolder = [System.IO.Path]::Combine($signalLogsFolder, "data")
     Get-ChildItem -Path $dataFolder -File | ForEach-Object {
 
       # give the child a meaningful variable name
-      $theLogDatFile = $_
+      $theLogDatFile = $_.FullName
 
       # Examine the filename, which is the leaf of the current object 
       $fileName = Split-Path -Path $theLogDatFile -Leaf
@@ -108,11 +107,11 @@ if (Test-Path -Path $controllerLogs) {
          $newIPAddressFileName = "SIEM_" + $controllerIP + "_" + $timestamp
 
          $newDatFileName = $newIPAddressFileName + ".dat"
-         $newDatFileWithPath = Join-Path $signalFolder $newDatFileName
+         $newDatFileWithPath = Join-Path $signalCsvFolder $newDatFileName
          if ($debugMode) { Write-Host "New IP File Name :" $newDatFileWithPath }
           
          $csvFileName = $newIPAddressFileName + ".csv"
-         $csvFileWithPath = Join-Path $signalFolder $csvFileName
+         $csvFileWithPath = Join-Path $signalCsvFolder $csvFileName
          if ($debugMode) { Write-Host "New CSV File Name :" $csvFileWithPath }
 
          # limit decoding to generate only NEW CSV files
