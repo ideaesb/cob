@@ -1,9 +1,9 @@
 ###############################################################################
-#                        CITY OF BRYAN, TEXAS                                 #
-#                   UBLIC WORKS, TRAFFIC OPERATIONS                           #
+#                            CITY OF BRYAN, TEXAS                             #
+#                          PUBLIC WORKS, TRAFFIC OPERATIONS                   #
 ###############################################################################
 #                                                                             #
-#                       PerfLogTranslate.ps1                                  #
+#                          PerfLogTranslate.ps1                               #
 #                                                                             #
 #  This Powershell shell script is designed to run as Windows Task.           #
 #                                                                             #
@@ -299,8 +299,13 @@ if (Test-Path -Path $controllerLogs) {
 
         # give the child a meaningful variable name
         $signalLogsFolder = $_.FullName
+
         if ($debugMode) {debug-log -message  "Entering coreLogsCsvTranformProcess $signalLogsFolder" } 
-    
+
+        # set the Powershell window title  
+        $currSignal = Split-Path -Path $signalLogsFolder -Leaf
+        $host.UI.RawUI.WindowTitle = "PerfLogTranslate.Ps1 [ALL]) current folder $currSignal in $controllerLogs"
+
         coreLogsCsvTranformProcess -debug $debugMode -signalFolderName $signalLogsFolder -outputCsvFolders $csvDirPath
     
       } # End of iterating through all signal folders in controller logs directory
@@ -312,23 +317,47 @@ if (Test-Path -Path $controllerLogs) {
   } 
   elseif ($signalID -gt 0 -and $signalID -le 114)
   {
+    # this will process just a single signal folder
+    $formattedNumber = "{0:000}" -f $signalID
 
-     # this will process just a single signal folder
-     $formattedNumber = "{0:000}" -f $signalID
-     if($debugMode) {debug-log -message  "Formatted Signal ID = $formattedNumber" }
-     
-     # pipe the controller logs directory into Where-Object to find folder that starts with signal ID
-     $signalLogsFolder = (Get-ChildItem -Path $controllerLogs | Where-Object { $_.Name -match "^$formattedNumber" } ).FullName
+    try
+    {
+      if($debugMode) {debug-log -message  "Formatted Signal ID = $formattedNumber" }
+      # pipe the controller logs directory into Where-Object to find folder that starts with signal ID
+      $signalLogsFolder = (Get-ChildItem -Path $controllerLogs | Where-Object { $_.Name -match "^$formattedNumber" } ).FullName
 
-     if ($debugMode) {debug-log -message  "Entering coreLogsCsvTranformProcess $signalLogsFolder" } 
-     coreLogsCsvTranformProcess -debug $debugMode -signalFolderName $signalLogsFolder -outputCsvFolders $csvDirPath
+      try
+      {
+        if (Test-Path -Path $signalLogsFolder)
+        {
+          if ($debugMode) {debug-log -message  "Entering coreLogsCsvTranformProcess $signalLogsFolder" } 
+   
+          # set the Powershell window title  
+          $winTitle = Split-Path -Path $signalLogsFolder -Leaf
+          $host.UI.RawUI.WindowTitle = "$winTitle (PerfLogTranslate.Ps1 -$signalID)"
 
+          coreLogsCsvTranformProcess -debug $debugMode -signalFolderName $signalLogsFolder -outputCsvFolders $csvDirPath
+        }
+        else
+        {
+          # this will most likely NEVER fire since $signalsLogsFolder would be null and Test-Path would fail
+          # therefore this debug-log will be repeated in catch block 
+          debug-log -message "ERROR: Could not find signal logs folder using signalID = $signalID in $controllerLogs" 
+        }
+      }
+      catch
+      {
+        debug-log -message "ERROR: Could not find signal logs folder using signalID = $signalID in $controllerLogs" 
+      }
+    }
+    catch 
+    {
+      debug-log -message "ERROR: Could not find signal logs folder using signalID = $signalID in $controllerLogs" 
+    } # End of try catch for name matching 
   }
   else 
   { 
-
     debug-log -message "Valid Signal IDs are 1 through 114 as of February 13, 2025" 
-
   } # End-If (signalID -eq 0) 
 } 
 else 
@@ -338,6 +367,8 @@ else
   debug-log -message "ERROR:  $controllerLogs does not exist (Controller Logs not found)." 
 
 } # End-If Test-Path -Path $controllerLogs 
+
+debug-log -message "PerfLogTranslate.Ps1 Complete" 
 
 # The End 
 # Some tests
