@@ -1,13 +1,26 @@
 # run perflogtranslate in parallel windows
 $scriptPath = "c:\Users\ukari\Documents\Signals\PerfLogTranslate.ps1"
 
-$startId = 20
-$endId = 22
+$startId = 72
+$endId = 72
 
+# signalId
+$windows = 0
 for ($i = $startId; $i -le $endId; $i++) {
-    $arguments = "-signalId", "$i"
-    Start-Process powershell.exe -ArgumentList "-NoExit", "-Command", "& { & '$scriptPath' $($arguments -join ' ') }"
+  for ($j = 2024; $j -le 2025; $j++) {
+    for ($k = 1; $k -le 31; $k++) {
+
+      $arguments = "-signalId", "$i", "-year", "$j", "-month", "$k"
+      # Start-Process powershell.exe -ArgumentList "-NoExit", "-Command", "& { & '$scriptPath' $($arguments -join ' ') }"
+
+      $windows = $windows + 1
+      Write-Host $arguments
+   
+    }
+  }
 }
+
+Write-Host "Numbers of Windows Spawned = $windows" 
 
 $memory = Get-WmiObject Win32_OperatingSystem
 $totalMemoryGB = [math]::Round($memory.TotalVisibleMemorySize / 1MB, 2)
