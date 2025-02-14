@@ -24,6 +24,7 @@
 #                                                                             #
 #   [Uday S. Kari 11-Feb-2025]  Initial Version                               #
 #   [Uday S. Kari 13-Feb-2025]  Multithreaded Calling (by SignalID) Enabled   #
+#   [Uday S. Kari 14-Feb-2025]  Enable calling by Date for massively parallel #
 #                                                                             #
 #                                                                             #
 ###############################################################################
@@ -33,8 +34,11 @@
 ## Command Line Parameters 
 
 param (
+ [switch] $debugMode,
  [int] $signalId,
- [switch] $debugMode
+ [int] $year,
+ [int] $month,
+ [int] $day 
 )
 
 
@@ -55,13 +59,67 @@ function debug-log {
 
 } # End of function debug-log
 
-# the main function 
+
+# if year, month or day were passed as parameters
+# the data file timestamp can be filtered in or out 
+# returns TRUE is ok to proceed, FALSE to skip...
+
+function dateFilter {
+
+  param (
+   [string] $timestamp,
+   [int] $year,
+   [int] $month,
+   [int] $day 
+  )  
+
+  if ($year -eq 0) 
+  { 
+    return $true
+  } 
+  elseif ($year -ne [int] $timestamp.Substring(0,4)) 
+  {
+    return $false
+  } 
+  else 
+  {
+    if ($month -eq 0)
+    {
+      return $true
+    }
+    elseif ($month -ne [int] $timestamp.Substring(5,2)) 
+    {
+      return $false
+    }
+    else
+    {
+      if ($day -eq 0)
+      {
+        return $true
+      }
+      elseif ($day -ne [int] $timestamp.Substring(8,2)) 
+      {
+        return $false
+      }
+      else
+      {
+        return $true
+      }
+    }
+  }
+} #End Function    
+
+
+# the main/core logic function 
 function coreLogsCsvTranformProcess {
   
    param (
      [bool]   $debug,
      [string] $signalFolderName,
-     [string] $outputCsvFolders
+     [string] $outputCsvFolders,
+     [int]    $year,
+     [int]    $month,
+     [int]    $day 
    )  
 
    
@@ -72,6 +130,7 @@ function coreLogsCsvTranformProcess {
       debug-log -message "BEGIN Function coreLogsCsvTranformProcess"  
       debug-log -message "Processing directory (Full Name) $signalFolderName"
       debug-log -message "Converting all the files therin into $outputCsvFolders"
+      debug-log -message "Just processing for date=year:{$year}-month:{$month}-day:{$day}, if day is zero, whole month, months is zero whole year and so on..."
     }
    } # End of Begin
 
@@ -119,67 +178,77 @@ function coreLogsCsvTranformProcess {
 
         if ($debug) { debug-log -message "Begin processing The DAT file : $fileName" }
 
-        # timestamp starts at position 18, and is 15 characters long
+        # timestamp ends at .dat and is 15 characters long
         $datPosition = $fileName.IndexOf(".dat")
         $timestamp = $filename.Substring($datPosition-15,15)
-        if ($debug) { debug-log -message "timestamp (start of file write) parsed out as : $timestamp" }
+        if ($debug) { debug-log -message "timestamp (which is the start of file write) parsed out as : $timestamp" }
 
-        # compute the new filename and add the full path
-        $newIPAddressFileName = "SIEM_" + $controllerIP + "_" + $timestamp
+        if (dateFilter -timestamp $timestamp -year $year -month $month -day $day)
+        {
 
-        $newDatFileName = $newIPAddressFileName + ".dat"
-        $newDatFileWithPath = Join-Path $outputCsvFolder $newDatFileName
-        if ($debug) { debug-log -message "New DAT File Name :  $newDatFileWithPath (Note that controller IP was replaced)" }
+          # compute the new filename and add the full path
+          $newIPAddressFileName = "SIEM_" + $controllerIP + "_" + $timestamp
+
+          $newDatFileName = $newIPAddressFileName + ".dat"
+          $newDatFileWithPath = Join-Path $outputCsvFolder $newDatFileName
+          if ($debug) { debug-log -message "New DAT File Name :  $newDatFileWithPath (Note that controller IP was replaced)" }
           
-        $csvFileName = $newIPAddressFileName + ".csv"
-        $csvFileWithPath = Join-Path $outputCsvFolder $csvFileName
-        if ($debug) { debug-log -message "New CSV File Name : $csvFileWithPath" }
+          $csvFileName = $newIPAddressFileName + ".csv"
+          $csvFileWithPath = Join-Path $outputCsvFolder $csvFileName
+          if ($debug) { debug-log -message "New CSV File Name : $csvFileWithPath" }
 
-         # limit decoding to generate only NEW CSV files
-         if (Test-Path -Path $csvFileWithPath )
-         {
-           # do absolutely nothing 
-           if ($debug) { debug-log -message "$csvFileWithPath already exists, skipping" }
-         } else {
+          # limit decoding to generate only NEW CSV files
+          if (Test-Path -Path $csvFileWithPath )
+          {
+            # do absolutely nothing 
+            if ($debug) { debug-log -message "$csvFileWithPath already exists, skipping" }
+          } else {
 
+            ###############################################################################
+            #  MAIN/CORE LOGIC OF THE PERF.LOG.TRANSLATE SCRIPT
+            #
+            #  This is most time intensive and brittle part, without which the script runs 
+            #  to quickly mirror the signal folders from controller logs (a side benefit)
+            #
+            #  3-step process to decode each file  
 
-           ###############################################################################
-           #  MAIN/CORE LOGIC OF THE PERF.LOG.TRANSLATE SCRIPT
-           #
-           #  This is most time intensive and brittle part, without which the script runs 
-           #  to quickly mirror the signal folders from controller logs (a side benefit)
-           #
-           #  3-step process to decode each file  
+            if ($debug) { debug-log -message "Decoding $newDatFileName" }
 
-           if ($debug) { debug-log -message "Decoding $newDatFileName" }
+            # Step 1: R E N A M E  (I P)
 
-           # Step 1: R E N A M E  (I P)
+            if ($debug) { debug-log -message "Copying & Renaming From : $theLogDatFile TO:  $newDatFileWithPath"}
+            Copy-Item -Path $theLogDatFile -Destination $newDatFileWithPath
 
-           if ($debug) { debug-log -message "Copying & Renaming From : $theLogDatFile TO:  $newDatFileWithPath"}
-           Copy-Item -Path $theLogDatFile -Destination $newDatFileWithPath
-
-           # Step 2: D E C O D E 
+            # Step 2: D E C O D E 
  
-           if ($debug) { debug-log -message "Decoding $newDatFileWithPath TO: $csvFileWithPath"}
-           Start-Process -FilePath $perfLogTranslateExe -ArgumentList $newDatFileWithPath -NoNewWindow -Wait
+            if ($debug) { debug-log -message "Decoding $newDatFileWithPath TO: $csvFileWithPath"}
+            Start-Process -FilePath $perfLogTranslateExe -ArgumentList $newDatFileWithPath -NoNewWindow -Wait
 
 
-           # Step 3: R E P L A C E (I P)
-           # Replace Line 1 with new IP
+            # Step 3: R E P L A C E (I P)
+            # Replace Line 1 with new IP
 
-           if ($debug) { debug-log -message "Replacing Line 1 in $csvFileWithPath"}
+            if ($debug) { debug-log -message "Replacing Line 1 in $csvFileWithPath"}
 
-           $content = Get-Content $csvFileWithPath
-           $content[0] = $controllerIP + ",,"
-           Set-Content $csvFileWithPath -Value $content
+            $content = Get-Content $csvFileWithPath
+            $content[0] = $controllerIP + ",,"
+            Set-Content $csvFileWithPath -Value $content
 
-           if ($debug) { debug-log -message "Finished processing CSV $csvFileWithPath" }
+            if ($debug) { debug-log -message "Finished with transformation (copy/rename/decode/replacement of Line 1) of $fileName in folder $signalFolderName into $csvFileWithPath"  }
 
-         } # End-If Test for existance of CSV file csvFileWithPath already exists in the staging area
+          } # End-If Test for existance of CSV file csvFileWithPath already exists in the staging area
 
+        } 
+        else
+        {
+          if ($debug) {debug-log -message "Skipped $fileName as it did not match date filter for timestamp date=year:{$year}-month:{$month}-day:{$day}" }
+        } # End-If Test for matching timestamp with date filter
+
+      } 
+      else
+      {
+        if ($debug) {debug-log -message "Skipped $fileName (JUNK FILE) because it does not start with SIEM" }
       } # End-If filename starts with "SIEM"
-
-      if ($debug) { debug-log -message "Decoded $fileName in folder $signalFolderName into $csvFileWithPath"  }
 
     } # End of Get-ChildItem listing of all data files for a signal
 
@@ -208,7 +277,7 @@ function coreLogsCsvTranformProcess {
 if ($debugMode) 
 { 
   debug-log -message "Starting up in DEBUG (Verbose) mode"
-  debug-log -message "Read parameters from command line as signalID = $signalID, debugMode = $debugMode"
+  debug-log -message "Read parameters from command line as debugMode = $debugMode, signalId = $signalId, date=year:{$year}-month:{$month}-day:{$day}"
 }
 else
 {
@@ -283,7 +352,7 @@ if (Test-Path -Path $controllerLogs) {
   if ($signalID -eq 0) 
   {
 
-    Write-Host 'Example Usage .\PerfLogTranslate.ps1 -signalID "007" -debugMode "True"'
+    Write-Host 'Example Usage .\PerfLogTranslate.ps1 -debugMode -signalID "007" -year "2024" -month "12" -day "02"'
     Write-Host "Note - SignalID command line parameter was NULL (0)." 
     Write-Host "Therefore, this scripts will now process ALL signal folders"
     Write-Host "Recommended to continue only if a few updates, continue?? (y/n)"    
@@ -306,7 +375,12 @@ if (Test-Path -Path $controllerLogs) {
         $currSignal = Split-Path -Path $signalLogsFolder -Leaf
         $host.UI.RawUI.WindowTitle = "PerfLogTranslate.Ps1 [ALL]) current folder $currSignal in $controllerLogs"
 
-        coreLogsCsvTranformProcess -debug $debugMode -signalFolderName $signalLogsFolder -outputCsvFolders $csvDirPath
+        coreLogsCsvTranformProcess -debug $debugMode `
+                                   -signalFolderName $signalLogsFolder `
+                                   -outputCsvFolders $csvDirPath `
+                                   -year $year `
+                                   -month $month `
+                                   -day $day `
     
       } # End of iterating through all signal folders in controller logs directory
     } 
@@ -336,7 +410,12 @@ if (Test-Path -Path $controllerLogs) {
           $winTitle = Split-Path -Path $signalLogsFolder -Leaf
           $host.UI.RawUI.WindowTitle = "$winTitle (PerfLogTranslate.Ps1 -$signalID)"
 
-          coreLogsCsvTranformProcess -debug $debugMode -signalFolderName $signalLogsFolder -outputCsvFolders $csvDirPath
+          coreLogsCsvTranformProcess -debug $debugMode `
+                                     -signalFolderName $signalLogsFolder `
+                                     -outputCsvFolders $csvDirPath `
+                                     -year $year `
+                                     -month $month `
+                                     -day $day `
         }
         else
         {
