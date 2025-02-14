@@ -1,9 +1,9 @@
 ###############################################################################
-#                            CITY OF BRYAN, TEXAS                             #
-#                          PUBLIC WORKS, TRAFFIC OPERATIONS                   #
+#                        CITY OF BRYAN, TEXAS                                 #
+#                   UBLIC WORKS, TRAFFIC OPERATIONS                           #
 ###############################################################################
 #                                                                             #
-#                          PerfLogTranslate.ps1                               #
+#                       PerfLogTranslate.ps1                                  #
 #                                                                             #
 #  This Powershell shell script is designed to run as Windows Task.           #
 #                                                                             #
@@ -23,103 +23,123 @@
 #   Version/History                                                           #
 #                                                                             #
 #   [Uday S. Kari 11-Feb-2025]  Initial Version                               #
+#   [Uday S. Kari 13-Feb-2025]  Multithreaded Calling (by SignalID) Enabled   #
 #                                                                             #
 #                                                                             #
 ###############################################################################
 
-$debugMode = $true
-$perfLogTranslateExe = "C:\Users\ukari\Downloads\PerfLogTranslate.exe"
 
 ###############################################################################
-# Remote/Shared Read-Only Directory maintained by Traffic Operations
-#
- 
-$controllerLogs = "R:\Public Works\Traffic Operations\SIGNALS\Signal Controller Logs"
+## Command Line Parameters 
 
-################################################################################
-# Local Working Directory for Data Processing and Visualization - CSV Files
-#
-# This is the output folder for this script 
-# This folder will be created in the same directory as this script.    
+param (
+ [int] $signalId,
+ [switch] $debugMode
+)
 
-$csvOutputFolder  = "signalControllerLogsCsv"
 
-# End of User-Defined Variables  
+###############################################################################
+## Functions 
 
-# Proceed if controller logs folder can be accessed by this script
-if (Test-Path -Path $controllerLogs) {
 
-  ############################################################################################
-  #   
-  #  Create local csvOutputFolder  (creating one if it does not already exist)
-
-  # Combine Present Working Directory (PWD) to create the full subdirectory path to csvFolder
-  $csvDirPath = [System.IO.Path]::Combine($PWD.Path, $csvOutputFolder)  
-  [System.IO.Directory]::CreateDirectory($csvDirPath) | Out-Null
-
-  ############################################################################################
-  #  Iterate through each directory which are named for each signal as 
-  #
-  #  001_Texas@OldHearne&Sims
-  #  002_Texas@Hwy21 
-  #  and so on, the three digit with leading zeroes numbers representing unique signal ID
-  #
+# Just adds new line, with timestamp (for now)
+function debug-log {
   
-  Get-ChildItem -Path $controllerLogs -Directory | ForEach-Object {
+   param (
+     [string] $message
+   )  
 
-    # give the child a meaningful variable name
-    $signalLogsFolder = $_.FullName
+   Write-Host ""
+   Write-Host $message
+   Write-Host (Get-Date).ToLocalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffK")
+
+} # End of function debug-log
+
+# the main function 
+function coreLogsCsvTranformProcess {
+  
+   param (
+     [bool]   $debug,
+     [string] $signalFolderName,
+     [string] $outputCsvFolders
+   )  
+
+   
+
+   begin {
+    if ($debug)
+    {
+      debug-log -message "BEGIN Function coreLogsCsvTranformProcess"  
+      debug-log -message "Processing directory (Full Name) $signalFolderName"
+      debug-log -message "Converting all the files therin into $outputCsvFolders"
+    }
+   } # End of Begin
+
+
+   # The Main Process
+   process {
+
     $signalName = Split-Path -Path $signalLogsFolder -Leaf
+    if ($debug) { debug-log -message "Processing signal: $signalName" }
 
-    if ($debugMode) { Write-Host "Processing directory (Full Name) " $signalLogsFolder  }
-    if ($debugMode) { Write-Host "Processing directory:" $signalName }
-    
-    
-    # Create the folder if it does not already exist
-    # By end of the loop, CSV directory will, as a result, mirror the controller logs directory
-    $signalCsvFolder = [System.IO.Path]::Combine($csvDirPath, $signalName)  
-    [System.IO.Directory]::CreateDirectory($signalCsvFolder) | Out-Null
-    if ($debugMode) { Write-Host "Created Signal Folder :" $signalCsvFolder }
+    # use signal name to get correspondind destination leaf 
+    $outputCsvFolder = Join-Path $outputCsvFolders $signalName
+    if ($debug) { debug-log -message "Its output folder will be : $outputCsvFolder" }
+    if (Test-Path -Path $outputCsvFolder )
+    {
+       if ($debug) { debug-log -message "$outputCsvFolder Exists...no action, proceed" }
+    }
+    else
+    {
+      [System.IO.Directory]::CreateDirectory($outputCsvFolder) | Out-Null
+      if ($debug) { debug-log -message "Created $outputCsvFolder (no errors)" }
+    }
+
+    # compute New IP address for signal controller based on signal ID used in naming folders
+    $signalID = [int] $signalName.Substring(0, 3)
+    $controllerIP = "192.168." + $signalID + ".11" 
+    if ($debug) { debug-log -message "Controller IP derived from $signalName = $controllerIP, (signalID = $signalID)" }
     
     # iterate through the data directory in signal folder of controller logs
-    $dataFolder = [System.IO.Path]::Combine($signalLogsFolder, "data")
+    $dataFolder = [System.IO.Path]::Combine($signalFolderName, "data")
+    if ($debug) { debug-log -message "data folder with all SIEM*.dat files : $dataFolder" }
+
     Get-ChildItem -Path $dataFolder -File | ForEach-Object {
 
       # give the child a meaningful variable name
       $theLogDatFile = $_.FullName
+      if ($debug) { debug-log -message "Full Name of DAT file : $theLogDatFile" }
 
       # Examine the filename, which is the leaf of the current object 
       $fileName = Split-Path -Path $theLogDatFile -Leaf
-      
-      # Only look for filenames that start with "SIEM", avoid any "config"
+      if ($debug) { debug-log -message "FileName of DAT file : $fileName" }
+
+      # Only transform filenames that start with "SIEM", avoid any "config"
       if ($fileName.StartsWith("SIEM")) {
 
+        if ($debug) { debug-log -message "Begin processing The DAT file : $fileName" }
 
-         # compute New IP address for signal controller based on signal ID using in folder name
-         $signalID = [int] $signalName.Substring(0, 3)
-         $controllerIP = "192.168." + $signalID + ".11" 
+        # timestamp starts at position 18, and is 15 characters long
+        $datPosition = $fileName.IndexOf(".dat")
+        $timestamp = $filename.Substring($datPosition-15,15)
+        if ($debug) { debug-log -message "timestamp (start of file write) parsed out as : $timestamp" }
 
-         # timestamp starts at position 18, and if 15 characters long
-         $timestamp = $filename.Substring(18,15)
+        # compute the new filename and add the full path
+        $newIPAddressFileName = "SIEM_" + $controllerIP + "_" + $timestamp
 
-         # compute the new filename and add the full path
-   
-         $newIPAddressFileName = "SIEM_" + $controllerIP + "_" + $timestamp
-
-         $newDatFileName = $newIPAddressFileName + ".dat"
-         $newDatFileWithPath = Join-Path $signalCsvFolder $newDatFileName
-         if ($debugMode) { Write-Host "New IP File Name :" $newDatFileWithPath }
+        $newDatFileName = $newIPAddressFileName + ".dat"
+        $newDatFileWithPath = Join-Path $outputCsvFolder $newDatFileName
+        if ($debug) { debug-log -message "New DAT File Name :  $newDatFileWithPath (Note that controller IP was replaced)" }
           
-         $csvFileName = $newIPAddressFileName + ".csv"
-         $csvFileWithPath = Join-Path $signalCsvFolder $csvFileName
-         if ($debugMode) { Write-Host "New CSV File Name :" $csvFileWithPath }
+        $csvFileName = $newIPAddressFileName + ".csv"
+        $csvFileWithPath = Join-Path $outputCsvFolder $csvFileName
+        if ($debug) { debug-log -message "New CSV File Name : $csvFileWithPath" }
 
          # limit decoding to generate only NEW CSV files
-         # if ($true) - can be toggle commented with production if - if need reuse 
          if (Test-Path -Path $csvFileWithPath )
          {
            # do absolutely nothing 
-           # if ($debugMode) { Write-Host $csvFileName " already exists, skipping" }
+           if ($debug) { debug-log -message "$csvFileWithPath already exists, skipping" }
          } else {
 
 
@@ -131,47 +151,194 @@ if (Test-Path -Path $controllerLogs) {
            #
            #  3-step process to decode each file  
 
-           if ($debugMode) { Write-Host "Decoding " $newDatFileName }
+           if ($debug) { debug-log -message "Decoding $newDatFileName" }
 
-           # Step 1:  
-           # Although there are ways to pipe content, to avoid any polution of the source
-           # copy the file to local/staging area, renaming it in the process, 
-           # thereby getting rid of IP in the name of the file.  COB IT Requirement. 
+           # Step 1: R E N A M E  (I P)
 
-           if ($debugMode) { Write-Host "Copying From :" $theLogDatFile " TO: " $newDatFileWithPath}
+           if ($debug) { debug-log -message "Copying & Renaming From : $theLogDatFile TO:  $newDatFileWithPath"}
            Copy-Item -Path $theLogDatFile -Destination $newDatFileWithPath
 
-           # Step 2: 
-           # Run the Yunex Decoder
-
-         
+           # Step 2: D E C O D E 
+ 
+           if ($debug) { debug-log -message "Decoding $newDatFileWithPath TO: $csvFileWithPath"}
            Start-Process -FilePath $perfLogTranslateExe -ArgumentList $newDatFileWithPath -NoNewWindow -Wait
 
 
-           # Step 3:
+           # Step 3: R E P L A C E (I P)
            # Replace Line 1 with new IP
+
+           if ($debug) { debug-log -message "Replacing Line 1 in $csvFileWithPath"}
 
            $content = Get-Content $csvFileWithPath
            $content[0] = $controllerIP + ",,"
            Set-Content $csvFileWithPath -Value $content
 
+           if ($debug) { debug-log -message "Finished processing CSV $csvFileWithPath" }
 
-         } # End-If Test for existance of CSV file already in the staging area
-
-         if ($debugMode) { Write-Host "Finished" $csvFileName }
+         } # End-If Test for existance of CSV file csvFileWithPath already exists in the staging area
 
       } # End-If filename starts with "SIEM"
 
-      if ($debugMode) { Write-Host $fileName }
+      if ($debug) { debug-log -message "Decoded $fileName in folder $signalFolderName into $csvFileWithPath"  }
 
     } # End of Get-ChildItem listing of all data files for a signal
 
-  } # End of Get-ChildItem listing of all the Signals 
+    if ($debug) { debug-log -message "Finished Processing signal: $signalName" }    
 
-} else { 
+   } # End of Process
 
-  # controller data logs not found
-  Write-Host $controllerLogs " does not exist.  Controller Logs not found." 
+
+
+   end {
+    if ($debug)
+    {
+      debug-log -message "END Function coreLogsCsvTranformProcess"  
+    }
+   } # End of End
+
+} # End of function coreLogsCsvTranformProcess 
+
+
+ 
+#######################################################################################
+
+
+# Begin PerfLogTranslate.ps1
+
+if ($debugMode) 
+{ 
+  debug-log -message "Starting up in DEBUG (Verbose) mode"
+  debug-log -message "Read parameters from command line as signalID = $signalID, debugMode = $debugMode"
+}
+else
+{
+  debug-log -message  "D E B U G    M O D E   I S   O F F"
+}
+
+
+###############################################################################
+# PerfLogTranslate Executable with complete path
+#
+
+$perfLogTranslateExe = "C:\Users\ukari\Downloads\PerfLogTranslate.exe"
+if ($debugMode) { debug-log -message  "perfLogTranslateExe = $perfLogTranslateExe" }
+
+
+###############################################################################
+# Remote/Shared Read-Only Directory maintained by Traffic Operations
+#
+
+$controllerLogs = "R:\Public Works\Traffic Operations\SIGNALS\Signal Controller Logs"
+if ($debugMode) {debug-log -message  "controllerLogs = $controllerLogs" }
+
+
+################################################################################
+# Local Working Directory for Data Processing and Visualization - CSV Files
+#
+# This is the output folder for this script 
+# This folder will be created in the same directory as this script.    
+
+$csvOutputFolder  = "signalControllerLogsCsv"
+if ($debugMode) { debug-log -message  "csvOutputFolder = $csvOutputFolder" }
+
+# End of User-Defined Variables  ###############################################
+
+
+################################################################################
+# Proceed only if controller logs folder can be accessed by this script
+#
+
+if ($debugMode) { debug-log -message  "Testing whether script can find and access " + $controllerLogs }
+
+if (Test-Path -Path $controllerLogs) {
+
+  if ($debugMode) {debug-log -message  "$controllerLogs has been found to exist and is accessible, begin work... " }
+
+  ############################################################################################
+  #   
+  #  Create local csvOutputFolder  (creating one if it does not already exist)
+
+  # Combine Present Working Directory (PWD) to create the full subdirectory path to csvFolder
+  $csvDirPath = [System.IO.Path]::Combine($PWD.Path, $csvOutputFolder)  
+  if (Test-Path -Path $csvDirPath) {debug-log -message  "$csvDirPath exists, no action " }
+  else 
+  { 
+     # .NET method to create directory, checking first, if it does not exist    
+     [System.IO.Directory]::CreateDirectory($csvDirPath) | Out-Null 
+     if ($debugMode) {debug-log -message  "$csvDirPath created" }
+  }
+
+
+  ############################################################################################
+  #    
+  #  Iterate through all directories which are named for each signal as 
+  #
+  #  001_Texas@OldHearne&Sims
+  #  002_Texas@Hwy21 
+  #  and so on, the three digit with leading zeroes numbers representing unique signal ID
+  #
+  #  However, if a signalID is provided, use it to narrow down to just one folder   
+  #
+
+  if ($signalID -eq 0) 
+  {
+
+    Write-Host 'Example Usage .\PerfLogTranslate.ps1 -signalID "007" -debugMode "True"'
+    Write-Host "Note - SignalID command line parameter was NULL (0)." 
+    Write-Host "Therefore, this scripts will now process ALL signal folders"
+    Write-Host "Recommended to continue only if a few updates, continue?? (y/n)"    
+
+    $whetherContinue = Read-Host
+    if ($whetherContinue -eq "y")
+    {
+      Write-Host "OK.  Processing all folders"
+      if ($debugMode) {debug-log -message  "Begin interating through the sub-directories of " + $controllerLogs } 
+      
+      # pipe the folders list into ForEach-Object
+      Get-ChildItem -Path $controllerLogs -Directory | ForEach-Object {
+
+        # give the child a meaningful variable name
+        $signalLogsFolder = $_.FullName
+        if ($debugMode) {debug-log -message  "Entering coreLogsCsvTranformProcess $signalLogsFolder" } 
+    
+        coreLogsCsvTranformProcess -debug $debugMode -signalFolderName $signalLogsFolder -outputCsvFolders $csvDirPath
+    
+      } # End of iterating through all signal folders in controller logs directory
+    } 
+    else
+    {
+      if ($debugMode) { debug-log -message  "End/Done without iterating through $controllerLogs.   (Graceful Exit)."}
+    } # End If whether continue
+  } 
+  elseif ($signalID -gt 0 -and $signalID -le 114)
+  {
+
+     # this will process just a single signal folder
+     $formattedNumber = "{0:000}" -f $signalID
+     if($debugMode) {debug-log -message  "Formatted Signal ID = $formattedNumber" }
+     
+     # pipe the controller logs directory into Where-Object to find folder that starts with signal ID
+     $signalLogsFolder = (Get-ChildItem -Path $controllerLogs | Where-Object { $_.Name -match "^$formattedNumber" } ).FullName
+
+     if ($debugMode) {debug-log -message  "Entering coreLogsCsvTranformProcess $signalLogsFolder" } 
+     coreLogsCsvTranformProcess -debug $debugMode -signalFolderName $signalLogsFolder -outputCsvFolders $csvDirPath
+
+  }
+  else 
+  { 
+
+    debug-log -message "Valid Signal IDs are 1 through 114 as of February 13, 2025" 
+
+  } # End-If (signalID -eq 0) 
+} 
+else 
+{ 
+
+  # if got here it means that remote signal controller data logs FOLDER was not found
+  debug-log -message "ERROR:  $controllerLogs does not exist (Controller Logs not found)." 
 
 } # End-If Test-Path -Path $controllerLogs 
-  
+
+# The End 
+# Some tests
+# Get-ChildItem |  ForEach-Object { if ((Split-Path -Path $_ -Leaf).Length -ne 37) {$_} } # for one digit, 38, 39 for 2,3 digit signal IDS
