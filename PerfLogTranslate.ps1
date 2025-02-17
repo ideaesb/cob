@@ -11,8 +11,7 @@
 #  containing high resolution log files in binary data format.                #
 #                                                                             #
 #  For each file, it will apply PerfLogTranslate.exe decoder to convert       #
-#  the dat file into commma separated value (CSV) files in the a local        #
-#  directory called highResCsv.                                               #
+#  the dat file into commma separated value (CSV) files in a local directory. #
 #                                                                             #
 #  In this process, it will remove the signal controller IP address from      #
 #  the filename and also its contents, replacing with a dummy IP to be        #
@@ -72,6 +71,19 @@ function dateFilter {
    [int] $month,
    [int] $day 
   )  
+
+
+  # first check if timestamp is valid
+
+  $regexPattern = "^\d{4}_\d{2}_\d{2}_\d{4}$"
+   
+  if ($timestamp -match $regexPattern) {
+    # OK - Write-Host "The string '$timestamp' matches the date format yyyy_mm_dd_hhhh."
+  } else {
+    Write-Host "ERROR: The string '$timestamp' does not match the date format yyyy_mm_dd_hhhh. Skipping File."
+    return $false
+  } 
+
 
   if ($year -eq 0) 
   { 
@@ -419,14 +431,17 @@ if (Test-Path -Path $controllerLogs) {
         }
         else
         {
-          # this will most likely NEVER fire since $signalsLogsFolder would be null and Test-Path would fail
-          # therefore this debug-log will be repeated in catch block 
+          # this will most likely fire because error in computation of folder name using leading zeroes
           debug-log -message "ERROR: Could not find signal logs folder using signalID = $signalID in $controllerLogs" 
+          debug-log -message "formattedNumber with leading zeros $formattedNumber"
         }
       }
       catch
       {
+        # this will fire because there was an error, period.  Unspecified.  Either signalLogsFolder NULL or 
+        # coreLogsCsvTranformProcess crashed out for some reason
         debug-log -message "ERROR: Could not find signal logs folder using signalID = $signalID in $controllerLogs" 
+        debug-log -message "SYSTEM ERROR: $Error"
       }
     }
     catch 
