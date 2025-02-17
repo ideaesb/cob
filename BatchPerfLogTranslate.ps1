@@ -7,15 +7,16 @@ $endId = 72
 # signalId
 $windows = 0
 for ($i = $startId; $i -le $endId; $i++) {
-  for ($j = 2024; $j -le 2025; $j++) {
-    for ($k = 1; $k -le 31; $k++) {
+  for ($j = 2024; $j -le 2024; $j++) {
+    for ($k = 12; $k -le 12; $k++) {
+     for ($l = 20;$l -le 20; $l++) {  
 
-      $arguments = "-signalId", "$i", "-year", "$j", "-month", "$k"
-      # Start-Process powershell.exe -ArgumentList "-NoExit", "-Command", "& { & '$scriptPath' $($arguments -join ' ') }"
+        $arguments = "-signalId", "'$i'", "-year", "'$j'", "-month", "'$k'", "-day", "'$l'"
+        Start-Process powershell.exe -ArgumentList "-NoExit", "-Command", "& { & '$scriptPath' $($arguments -join ' ') }"
 
-      $windows = $windows + 1
-      Write-Host $arguments
-   
+        $windows = $windows + 1
+        Write-Host $arguments
+      }   
     }
   }
 }
