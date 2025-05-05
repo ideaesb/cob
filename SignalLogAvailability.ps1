@@ -109,10 +109,10 @@ foreach ($signal in $validSignals) {
       $line = "$signal,$($currentDate.ToString('yyyy-MM-dd')),$fileCountForDay"
       # Append to a file
       # Add header if file is new
-      if (-not (Test-Path "output.csv")) {
+      if (-not (Test-Path "SignalLogAvailability.csv")) {
            "Signal,Date,FileCount" | Out-File -FilePath "output.csv"
       }
-      $line | Out-File -FilePath "output.csv" -Append
+      $line | Out-File -FilePath "SignalLogAvailability.csv" -Append
     }
     
     $currentDate = $currentDate.AddDays(1)
