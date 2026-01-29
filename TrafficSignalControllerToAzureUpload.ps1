@@ -90,11 +90,25 @@ $ConfirmPreference = 'None'
 $ProgressPreference = 'SilentlyContinue'
 $ErrorActionPreference = "Stop"
 
+function Get-OneLineError {
+    param([object]$Err)
+
+    # Works for caught exceptions and error records
+    $msg = $null
+    try { $msg = $Err.Exception.Message } catch {}
+    if ([string]::IsNullOrWhiteSpace($msg)) { $msg = "$Err" }
+
+    # collapse whitespace/newlines
+    $msg = ($msg -replace '\s+', ' ').Trim()
+    return $msg
+}
 
 # --- 0. PLATFORM CHECK ---
-if ($PSVersionTable.PSVersion.Major -lt 5) {
-    Write-Error "This script requires PowerShell 5.1 or higher."
-    exit 1
+if ($PSVersionTable.PSVersion -lt [version]"5.1") {
+    throw "This script requires PowerShell 5.1 or higher."
+}
+if ($PSVersionTable.PSVersion.Major -ge 7) {
+    throw "This script must NOT run in PowerShell 7+ (pwsh.exe). Use Windows PowerShell 5.1 (powershell.exe)."
 }
 
 # --- 1. ENVIRONMENT SETUP ---
@@ -145,9 +159,10 @@ $MissingDeps = @()
 foreach ($file in $Deps) {
     if (-not (Test-Path (Join-Path $ScriptHome $file))) { $MissingDeps += $file }
 }
+# Missing deps
 if ($MissingDeps.Count -gt 0) {
     Write-Log "FATAL: Missing dependencies in $ScriptHome : $($MissingDeps -join ', ')" "Red"
-    exit 1
+    throw "Missing dependencies: $($MissingDeps -join ', ')"
 }
 
 # Check WinSCP
@@ -157,7 +172,17 @@ if (Test-Path $WinSCPPath) { $SCP = $true }
 else { Write-Log "WARNING: WinSCP not found. SFTP will not be possible." "Yellow" }
 # Load WinSCP Assembly for .NET usage
 $WinSCPDll = "C:\Program Files (x86)\WinSCP\WinSCPnet.dll"
-if (Test-Path $WinSCPDll) { Add-Type -Path $WinSCPDll } else { $SCP = $false; Write-Log "WARNING: WinSCPnet.dll not found." "Yellow" }
+if (Test-Path $WinSCPDll) {
+    try { Add-Type -Path $WinSCPDll -ErrorAction Stop }
+    catch { $SCP = $false; Write-Log ("WARNING: Failed to load WinSCPnet.dll: {0}" -f (Get-OneLineError $_)) "Yellow" }
+
+
+    if ($SCP) {
+        try { [void][WinSCP.Session] } catch { $SCP = $false; Write-Log "WARNING: WinSCP types not available after Add-Type. Disabling SFTP." "Yellow" }
+    }
+}
+if (-not $SCP) { Write-Log "WARNING: SFTP will not be possible." "Yellow" }
+
 
 # CRITICAL: Enforce TLS 1.2
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -171,7 +196,7 @@ try {
     if (-not $TcpTest) { throw "TCP Connect failed" }
 } catch {
     Write-Log "FATAL: Cannot reach Azure Storage ($AzureHost). Check network." "Red"
-    exit 1
+    throw "Cannot reach Azure Storage ($AzureHost): $($_.Exception.Message)"
 }
 
 # --- 3. PARSE IDS & LOAD CSV ---
@@ -219,8 +244,6 @@ foreach ($line in Get-Content -Path $TrafficCsv) {
 # Keep only rows with numeric IDs (active or excluded)
 $MasterList = $MasterList | Where-Object { $_.ID -match '^\d+$' }
 
-# CRITICAL FIX: Filter out the Header row (where ID="ID") or empty rows
-
 # If $IDs provided, parse. Else use all from CSV.
 if (-not [string]::IsNullOrWhiteSpace($IDs)) {
     $RawIDs = @()
@@ -247,19 +270,6 @@ Write-Log "Processing $($SignalList.Count) signals..." "Cyan"
 
 # --- HELPER FUNCTIONS ---
 
-function Get-OneLineError {
-    param([object]$Err)
-
-    # Works for caught exceptions and error records
-    $msg = $null
-    try { $msg = $Err.Exception.Message } catch {}
-    if ([string]::IsNullOrWhiteSpace($msg)) { $msg = "$Err" }
-
-    # collapse whitespace/newlines
-    $msg = ($msg -replace '\s+', ' ').Trim()
-    return $msg
-}
-
 function Remove-TreeSafe {
     param([Parameter(Mandatory)] [string]$Path)
 
@@ -273,44 +283,171 @@ function Remove-TreeSafe {
         break
       } catch {
         Start-Sleep -Seconds 2
-        if ($i -eq 3) { Write-Log "   Warning: Could not remove $StagingFolder after retries." "Yellow" }
+        if ($i -eq 3) { Write-Log "   Warning: Could not remove $Path after retries." "Yellow" }
      }
    }
 }
 
 function Get-AzureLastDate {
-    param([int]$SigID)
-    $MkUrl = { param($Dt) "$AzureBase/SIEM_192.168.$SigID.11_$($Dt.ToString('yyyy_MM_dd_HH'))00.csv" }
-    function Test-Url ($U) { try { $R=Invoke-WebRequest -UseBasicParsing -Uri $U -Method Head -ErrorAction SilentlyContinue; return ($R.StatusCode -eq 200) } catch { return $false } }
+    <#
+      Returns the latest hour-bucket datetime that exists in Azure for a given signal ID,
+      based on file naming: SIEM_192.168.<SigID>.11_yyyy_MM_dd_HH00.csv
 
-    $Now = (Get-Date).Date.AddHours((Get-Date).Hour + 1)
-    $Intervals = @(0, 1, 3, 7, 14, 30, 60)
-    $FoundAnchor=$null; $MissAnchor=$null
-    
-    foreach ($D in $Intervals) {
-        $Probe = $Now.AddDays(-$D); foreach ($H in @(12, 8, 18, 0)) { $T = $Probe.Date.AddHours($H); if (Test-Url (&$MkUrl $T)) { $FoundAnchor=$T; $PrevOff = if ($D -eq 0) {0} else { $Intervals[[Array]::IndexOf($Intervals, $D)-1] }; $MissAnchor=$Now.AddDays(-$PrevOff); break } }
-        if ($FoundAnchor) { break }
+      - Fast: checks recent hours first (last ~72 hours)
+      - Safe: never assumes something is missing unless we prove it
+      - Robust: falls back to day-level then month-level probes if needed
+
+      Output: [datetime] or $null if nothing found.
+    #>
+
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [ValidateRange(1,999)]
+        [int]$SigID,
+
+        [Parameter(Mandatory=$false)]
+        [int]$LookbackHours = 72,
+
+        [Parameter(Mandatory=$false)]
+        [datetime]$LimitDate = (Get-Date -Year 2025 -Month 1 -Day 1 -Hour 0 -Minute 0 -Second 0)
+    )
+
+    if ([string]::IsNullOrWhiteSpace($AzureBase)) {
+        throw "Get-AzureLastDate requires `$AzureBase to be set (e.g. https://<account>.blob.core.windows.net/siglog)."
     }
-    
-    $LimitDate = Get-Date -Year 2025 -Month 1 -Day 1
-    if (-not $FoundAnchor) {
-        $Deep = $Now.AddDays(-60)
-        while ($Deep -ge $LimitDate) {
-            $T = Get-Date -Year $Deep.Year -Month $Deep.Month -Day 1 -Hour 12
-            if (Test-Url (&$MkUrl $T)) { $FoundAnchor=$T; $MissAnchor=$T.AddMonths(1); break }
-            $Deep = $Deep.AddMonths(-1)
+
+    # --- Helpers ---
+    $MkUrl = {
+        param([datetime]$Dt)
+        # normalize to hour bucket
+        $dtHour = Get-Date -Year $Dt.Year -Month $Dt.Month -Day $Dt.Day -Hour $Dt.Hour -Minute 0 -Second 0 -Millisecond 0
+        "$AzureBase/SIEM_192.168.$SigID.11_$($dtHour.ToString('yyyy_MM_dd_HH'))00.csv"
+    }
+
+    function Test-Url {
+        param([string]$U)
+        try {
+            $r = Invoke-WebRequest -UseBasicParsing -Uri $U -Method Head -ErrorAction Stop
+            return ($r.StatusCode -eq 200)
+        } catch {
+            $code = $null
+            try { $code = $_.Exception.Response.StatusCode.Value__ } catch {}
+            return ($code -in 401,403)  # exists but access denied
+        }
+   }
+
+
+    function Trunc-ToHour {
+        param([datetime]$dt)
+        Get-Date -Year $dt.Year -Month $dt.Month -Day $dt.Day -Hour $dt.Hour -Minute 0 -Second 0 -Millisecond 0
+    }
+
+    # We only consider completed hours (avoid "current partial hour")
+    $now = Get-Date
+    $end = Trunc-ToHour ($now.AddHours(-1))
+
+    # ---------- Phase 1: Hour-by-hour recent scan (fast & deterministic) ----------
+    $start = $end.AddHours(-$LookbackHours)
+    if ($start -lt $LimitDate) { $start = $LimitDate }
+
+    for ($t = $end; $t -ge $start; $t = $t.AddHours(-1)) {
+        if (Test-Url (& $MkUrl $t)) {
+            return (Trunc-ToHour $t)
         }
     }
-    
-    if (-not $FoundAnchor) { return $null }
 
-    $Low=$FoundAnchor; $High=$MissAnchor; $Best=$Low
-    while (($High - $Low).TotalHours -gt 1) {
-        $Mid = $Low.AddHours([Math]::Floor(($High - $Low).TotalHours / 2))
-        if (Test-Url (&$MkUrl $Mid)) { $Low=$Mid; $Best=$Mid } else { $Prev = $Mid.AddHours(-1); if (Test-Url (&$MkUrl $Prev)) { $Best=$Prev; break } else { $High=$Mid } }
+    # ---------- Phase 2: Day probes for older data (check last ~120 days) ----------
+    $dayEnd = $start.AddHours(-1)
+    if ($dayEnd -lt $LimitDate) { return $null }
+
+    $maxDays = 120
+    $d0 = Trunc-ToHour $dayEnd
+    $dStart = $d0.AddDays(-$maxDays)
+    if ($dStart -lt $LimitDate) { $dStart = $LimitDate }
+
+    # Probe midday first (most likely to exist if any file exists that day), then a few other hours.
+    $probeHours = @(12, 18, 8, 0, 23)
+
+    $foundDayAnchor = $null
+
+    for ($day = $d0.Date; $day -ge $dStart.Date; $day = $day.AddDays(-1)) {
+        foreach ($h in $probeHours) {
+            $t = (Get-Date -Year $day.Year -Month $day.Month -Day $day.Day -Hour $h -Minute 0 -Second 0 -Millisecond 0)
+            if ($t -lt $LimitDate) { continue }
+            if (Test-Url (& $MkUrl $t)) {
+                $foundDayAnchor = $t
+                break
+            }
+        }
+        if ($foundDayAnchor) { break }
     }
-    return $Best
+
+    if (-not $foundDayAnchor) {
+        # ---------- Phase 3: Month probes down to LimitDate ----------
+        $m = Get-Date -Year $d0.Year -Month $d0.Month -Day 1 -Hour 12 -Minute 0 -Second 0 -Millisecond 0
+        while ($m -ge $LimitDate) {
+            if (Test-Url (& $MkUrl $m)) {
+                $foundDayAnchor = $m
+                break
+            }
+            $m = $m.AddMonths(-1)
+        }
+        if (-not $foundDayAnchor) { return $null }
+    }
+
+    # ---------- Phase 4: Find exact latest hour near the anchor ----------
+    # We now know *something* exists at/near $foundDayAnchor, but not which hour is the latest.
+    # Strategy:
+    #   1) Find an upper bound hour that is missing by walking forward up to 48 hours.
+    #   2) Binary search between last-known-good and first-known-missing.
+    $low = Trunc-ToHour $foundDayAnchor
+    if (-not (Test-Url (& $MkUrl $low))) {
+        # If anchor hour itself doesn't exist (rare), walk backward a bit within the day to find a real low.
+        $backFound = $false
+        for ($i=1; $i -le 24; $i++) {
+            $cand = $low.AddHours(-$i)
+            if ($cand -lt $LimitDate) { break }
+            if (Test-Url (& $MkUrl $cand)) { $low = $cand; $backFound = $true; break }
+        }
+        if (-not $backFound) { return $null }
+    }
+
+    $high = $low
+    $missingFound = $false
+    for ($i=1; $i -le 48; $i++) {
+        $cand = $low.AddHours($i)
+        # don't search into future (past completed hour)
+        if ($cand -gt $end) { $high = $end.AddHours(1); $missingFound = $true; break }
+
+        if (-not (Test-Url (& $MkUrl $cand))) {
+            $high = $cand
+            $missingFound = $true
+            break
+        }
+    }
+    if (-not $missingFound) {
+        # Could not find a missing hour within +48; set a safe high bound (end+1)
+        $high = $end.AddHours(1)
+    }
+
+    $best = $low
+
+    while (($high - $low).TotalHours -gt 1) {
+        $mid = $low.AddHours([math]::Floor((($high - $low).TotalHours) / 2))
+        if ($mid -gt $end) { $high = $mid; continue }
+
+        if (Test-Url (& $MkUrl $mid)) {
+            $best = $mid
+            $low = $mid
+        } else {
+            $high = $mid
+        }
+    }
+
+    return (Trunc-ToHour $best)
 }
+
 
 function Truncate-ToHour {
     param (
@@ -367,8 +504,42 @@ foreach ($Sig in $SignalList) {
     Write-Log "Processing ID ${IDVal}: $Name" "Cyan"
 
 
-    $SwitchIP = $Sig.Switch
+    $SwitchIP = ("" + $Sig.Switch).Trim()   # safe for powershell 5.1
     $CtrlIP   = $Sig.Controller
+
+    # --- VALIDATIONS ---
+    # Do some cheap validation for known patterns in City of Bryan Traffic Signal Controller IP Addresses
+    # Basically, Controller IP must be present and match the pattern 10.105.[0-5].y, whereby y is 0-255
+    # In case wondering about cleaning Switch IP it is pattern free - we have BNS names for them like texas_villamaria-ie3000.cobnet.org, so could be entered into the csv files as such any string
+
+    $ctrl = ("" + $CtrlIP).Trim() # safe for powershell 5.1
+
+    $octetY  = '(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)'   # 0–255
+    $ctrlPat = "^10\.105\.[0-5]\.$octetY$"
+
+    if ([string]::IsNullOrWhiteSpace($ctrl)) {
+        Write-Log "   Missing Controller IP in CSV. Skipping." "Yellow"
+        $Summary += [PSCustomObject]@{
+            ID=$IDVal; Name=$Name; Status="Skipped (Missing Controller IP)"; From=$null; To=$null; Count=0
+        }
+        if (-not [string]::IsNullOrWhiteSpace($StagingFolder)) { Remove-TreeSafe $StagingFolder }
+        continue
+    }
+
+    if ($ctrl -notmatch $ctrlPat) {
+        Write-Log ("   Invalid Controller IP in CSV: '{0}'. Expected 10.105.[0-5].y." -f $CtrlIP) "Yellow"
+        $Summary += [PSCustomObject]@{
+            ID=$IDVal; Name=$Name; Status="Skipped (Invalid Controller IP)"; From=$null; To=$null; Count=0
+        }
+        if (-not [string]::IsNullOrWhiteSpace($StagingFolder)) { Remove-TreeSafe $StagingFolder }
+        continue
+    }
+
+    # Normalize after validation
+    $CtrlIP = $ctrl
+
+
+
 
     # Organize Folder Names
     $PaddedID = "{0:D3}" -f $IDVal
@@ -376,7 +547,7 @@ foreach ($Sig in $SignalList) {
     $SignalFolder = "${PaddedID}_${SafeName}"
     $StagingFolder = Join-Path $StagingBase $SignalFolder
     
-    if (Test-Path $StagingFolder) { Remove-Item $StagingFolder -Recurse -Force | Out-Null }
+    if (Test-Path $StagingFolder) { Remove-TreeSafe $StagingFolder}
     New-Item $StagingFolder -ItemType Directory -Force | Out-Null
     
     # Archive Paths
@@ -445,7 +616,8 @@ foreach ($Sig in $SignalList) {
            Count=0
         }
 
-        Remove-Item $StagingFolder -Force; continue
+        Remove-TreeSafe $StagingFolder
+        continue
     }
 
 
@@ -466,76 +638,97 @@ foreach ($Sig in $SignalList) {
 
     # Step 3: Controller Download
     if ($FileList.Count -gt 0 -and -not [string]::IsNullOrWhiteSpace($CtrlIP) -and $SCP) {
-        $Session = New-Object WinSCP.Session
-        $Strategies = @(
-            @{ Type="FTP"; User=$ftpUser; Pass=$ftpPassword; Key=$null },
-            @{ Type="SFTP"; User="admin"; Pass=$null; Key=(Join-Path $ScriptHome "default.ppk") },
-            @{ Type="SFTP"; User="admin"; Pass=$null; Key=(Join-Path $ScriptHome "ATCnx4.4_rsa.ppk") }
-        )
-        
-        $Connected = $false; $RemoteRoot = ""
-        
-        foreach ($Strat in $Strategies) {
-            try {
-                $Opt = New-Object WinSCP.SessionOptions
-                $Opt.HostName=$CtrlIP; $Opt.UserName=$Strat.User; $Opt.TimeoutInMilliseconds=8000
-                if ($Strat.Type -eq "FTP") { $Opt.Protocol=[WinSCP.Protocol]::Ftp; $Opt.Password=$Strat.Pass }
-                else { $Opt.Protocol=[WinSCP.Protocol]::Sftp; $Opt.SshPrivateKeyPath=$Strat.Key; $Opt.GiveUpSecurityAndAcceptAnySshHostKey=$true }
-                
-                if ($Session.Opened) { $Session.Dispose(); $Session = New-Object WinSCP.Session }
-                $Session.Open($Opt)
-                
-                if ($Session.FileExists("/mnt/sd")) { $RemoteRoot="/mnt/sd" }
-                elseif ($Session.FileExists("/mount/sd")) { $RemoteRoot="/mount/sd" }
-                elseif ($Session.FileExists("/media/sd")) { $RemoteRoot="/media/sd" }
-                
-                if ($RemoteRoot) {
-                    $Connected = $true
-                    Write-Log "   Connected via $($Strat.Type) ($($Strat.Key))." "Green"
-                    break
-                }
-            } 
-            catch 
-           {
-             $e = Get-OneLineError $_
-             Write-Log ("   Connection failed ({0}): {1}" -f $Strat.Type, $e) "Yellow"
-           }
-        }
 
-        if ($Connected) {
-            $DlCount = 0
-            foreach ($File in $FileList.ToArray()) {
-                $RP = "$RemoteRoot/$File".Replace("//","/")
-                $LP = Join-Path $StagingFolder $File
+        $Session = New-Object WinSCP.Session
+        $Connected = $false
+        $RemoteRoot = ""
+
+        try {
+            $Strategies = @(
+                @{ Type="FTP";  User=$ftpUser; Pass=$ftpPassword; Key=$null },
+                @{ Type="SFTP"; User="admin";  Pass=$null;       Key=(Join-Path $ScriptHome "default.ppk") },
+                @{ Type="SFTP"; User="admin";  Pass=$null;       Key=(Join-Path $ScriptHome "ATCnx4.4_rsa.ppk") }
+            )
+
+            foreach ($Strat in $Strategies) {
                 try {
-                    if ($Session.FileExists($RP)) {
-                        $Session.GetFiles($RP, $LP).Check()
-                        [void]$FileList.Remove($File)
-                        $FoundCount++; $DlCount++
+                    $Opt = New-Object WinSCP.SessionOptions
+                    $Opt.HostName = $CtrlIP
+                    $Opt.UserName = $Strat.User
+                    $Opt.TimeoutInMilliseconds = 8000
+
+                    if ($Strat.Type -eq "FTP") {
+                        $Opt.Protocol = [WinSCP.Protocol]::Ftp
+                        $Opt.Password = $Strat.Pass
+                    } else {
+                        $Opt.Protocol = [WinSCP.Protocol]::Sftp
+                        $Opt.SshPrivateKeyPath = $Strat.Key
+                        $Opt.GiveUpSecurityAndAcceptAnySshHostKey = $true
                     }
-                } 
-                catch 
-                {
-                   $e = Get-OneLineError $_
-                   Write-Log ("   Download check failed: {0}" -f $e) "Yellow"
+
+                    if ($Session.Opened) { $Session.Dispose(); $Session = New-Object WinSCP.Session }
+                    $Session.Open($Opt)
+
+                    if ($Session.FileExists("/mnt/sd"))      { $RemoteRoot="/mnt/sd" }
+                    elseif ($Session.FileExists("/mount/sd")){ $RemoteRoot="/mount/sd" }
+                    elseif ($Session.FileExists("/media/sd")){ $RemoteRoot="/media/sd" }
+
+                    if ($RemoteRoot) {
+                        $Connected = $true
+                        Write-Log "   Connected via $($Strat.Type) ($($Strat.Key))." "Green"
+                        break
+                    }
+                } catch {
+                    $e = Get-OneLineError $_
+                    Write-Log ("   Connection failed ({0}): {1}" -f $Strat.Type, $e) "Yellow"
+                    # try next strategy
+                    continue
                 }
             }
-            Write-Log "   Downloaded $DlCount files from Controller." "Cyan"
-            $Session.Dispose()
-        } else {
-            # Ping check
-            if ($SwitchIP) {
-                $Ping = Test-Connection $SwitchIP -Count 1 -ErrorAction SilentlyContinue
-                if ($Ping) { Write-Log "   Controller Unreachable, Switch OK (${Ping.ResponseTime}ms)" "Magenta" }
-                else { Write-Log "   Switch Unreachable" "Red" }
-            } else { Write-Log "   Controller Unreachable (No Switch IP)" "Red" }
+
+            if ($Connected) {
+                $DlCount = 0
+                foreach ($File in $FileList.ToArray()) {
+                    $RP = "$RemoteRoot/$File".Replace("//","/")
+                    $LP = Join-Path $StagingFolder $File
+                    try {
+                        if ($Session.FileExists($RP)) {
+                            $Session.GetFiles($RP, $LP).Check()
+                            [void]$FileList.Remove($File)
+                            $FoundCount++; $DlCount++
+                        }
+                    } catch {
+                        $e = Get-OneLineError $_
+                        Write-Log ("   Download check failed: {0}" -f $e) "Yellow"
+                        if ($e -match 'unexpectedly closed|Lost connection|Timeout detected') {
+                            Write-Log "   Session appears dead; abandoning remaining downloads this run." "Yellow"
+                            break
+                        }
+                    }
+                }
+                Write-Log "   Downloaded $DlCount files from Controller." "Cyan"
+            } else {
+                # Ping check
+                if ($SwitchIP) {
+                    $Ping = Test-Connection $SwitchIP -Count 1 -ErrorAction SilentlyContinue
+                    if ($Ping) { 
+                        Write-Log ("   Controller Unreachable, Switch OK ({0}ms)" -f $Ping.ResponseTime) "Magenta" 
+                    } else { Write-Log "   Switch Unreachable" "Red" }
+                } else {
+                    Write-Log "   Controller Unreachable (Cannot reach Switch $SwitchIP)" "Red"
+                }
+            }
+        }
+        finally {
+            if ($Session) { $Session.Dispose() }
         }
     }
+
 
     # Step 6: Verify Found Files
     if ($FoundCount -eq 0) {
         Write-Log "   No files found (Archive or Controller). Skipping." "Yellow"
-        Remove-Item $StagingFolder -Force
+        Remove-TreeSafe $StagingFolder
         $Summary += [PSCustomObject]@{
           ID     = $IDVal
           Name   = $Name
@@ -549,12 +742,16 @@ foreach ($Sig in $SignalList) {
 
     # Step 6b: Translate
     Write-Log "   Translating $FoundCount files..." "Cyan"
-    Set-Location $StagingFolder
+    # some cheap protection against Set-Location failure   
+    try { Set-Location -LiteralPath $StagingFolder } catch {
+      Write-Log ("   FATAL: Cannot Set-Location to StagingFolder: {0}" -f (Get-OneLineError $_)) "Red"
+      continue
+    }
     $TransExe = Join-Path $ScriptHome "PerfLogTranslate.exe"
-    # Execute natively within directory
-    $Back = Get-Location; Set-Location $StagingFolder
+    # Execute natively within Staging directory
     try { & $TransExe -i *.dat | Out-Null } catch { Write-Log "   Translate Error: $_" "Red" }
-    Set-Location $Back
+    # get out of there to then be able to delete Statging area later
+    Set-Location $ScriptHome 
     
     # Step 7: Rename & Fix IP
     $Csvs = Get-ChildItem -Path $StagingFolder -Filter "*.csv"
@@ -616,146 +813,162 @@ foreach ($Sig in $SignalList) {
 
     # Step 9: Archive & Cleanup
     Write-Log "   Archiving..." "Gray"
-    Get-ChildItem $StagingFolder -Filter "*.dat" | Move-Item -Destination $DataArchDest -Force
-    Get-ChildItem $StagingFolder -Filter "*.csv" | Move-Item -Destination $CsvArchDest -Force
+    Get-ChildItem -Path $StagingFolder -Filter "*.dat" -ErrorAction SilentlyContinue | Move-Item -Destination $DataArchDest -Force
+    Get-ChildItem -Path $StagingFolder -Filter "*.csv" -ErrorAction SilentlyContinue | Move-Item -Destination $CsvArchDest  -Force
+
     
     # Make sure get out of Staging Area before clean-up
     Set-Location $ScriptHome
-    if ((Get-ChildItem $StagingFolder).Count -eq 0) {
-       Remove-TreeSafe $StagingFolder
-    } else {
-        Write-Log "   Warning: Staging folder not empty." "Yellow"
+
+    if (-not (Test-Path -LiteralPath $StagingFolder)) {
+        # already gone
     }
+    else {
+        $items = @(Get-ChildItem -LiteralPath $StagingFolder -ErrorAction SilentlyContinue)
+        if ($items.Count -eq 0) {
+            Remove-TreeSafe $StagingFolder
+        } else {
+            Write-Log "   Warning: Staging folder not empty." "Yellow"
+        }
+    }
+
+
 }
 
 # Final Summary
-Write-Log "--- FINAL SUMMARY ---" "Cyan"
+if (-not $Summary -or $Summary.Count -eq 0) {
+    Write-Log "No summary rows were produced; nothing to print." "Yellow"
+}
+else 
+{
+        
+    Write-Log "--- FINAL SUMMARY ---" "Cyan"
 
-# Define column widths (tuned to your data)
-function Get-MaxLen {
-    param(
-        [string]$Header,
-        [string[]]$Values,
-        [int]$Cap = 60
-    )
-    $lens = @($Header.Length)
-    foreach ($v in $Values) {
-        if ($null -eq $v) { continue }
-        $lens += ([string]$v).Length
+    # Define column widths (tuned to your data)
+    function Get-MaxLen {
+        param(
+            [string]$Header,
+            [string[]]$Values,
+            [int]$Cap = 60
+        )
+        $lens = @($Header.Length)
+        foreach ($v in $Values) {
+            if ($null -eq $v) { continue }
+            $lens += ([string]$v).Length
+        }
+        $m = ($lens | Measure-Object -Maximum).Maximum
+        return [Math]::Min($Cap, [int]$m)
     }
-    $m = ($lens | Measure-Object -Maximum).Maximum
-    return [Math]::Min($Cap, [int]$m)
-}
 
-function Fit {
-    param(
-        [AllowNull()][object]$Value,
-        [int]$Width
-    )
-    $s = if ($null -eq $Value) { "" } else { [string]$Value }
-    if ($s.Length -le $Width) { return $s }
-    if ($Width -le 3) { return $s.Substring(0, $Width) }
-    return ($s.Substring(0, $Width - 3) + "...")
-}
+    function Fit {
+        param(
+            [AllowNull()][object]$Value,
+            [int]$Width
+        )
+        $s = if ($null -eq $Value) { "" } else { [string]$Value }
+        if ($s.Length -le $Width) { return $s }
+        if ($Width -le 3) { return $s.Substring(0, $Width) }
+        return ($s.Substring(0, $Width - 3) + "...")
+    }
 
+    try
+    {
+        $display = foreach ($row in $Summary) {
+            $when =
+                if ($row.Status -like "Success*") {
+                    "{0} -> {1}" -f
+                        $row.From.ToString("M/d/yyyy h:mm tt"),
+                        $row.To.ToString("M/d/yyyy h:mm tt")
+                }
+                elseif ($row.Status -like "Skipped (commented out in input)*") {
+                    ""
+                }
+                elseif ($row.From -is [datetime]) {
+                    "Last Azure: {0}" -f $row.From.ToString("M/d/yyyy h:mm tt")
+                }
+                else {
+                    "Last Azure: unknown"
+                }
 
-
-
-
-# Header
-Write-Host ($fmt -f "ID","Name","Status","From / To / Last Azure","Count") -ForegroundColor Cyan
-Write-Host ($fmt -f "--","----","------","------------------------","-----") -ForegroundColor Cyan
-
-$display = foreach ($row in $Summary) {
-    $when =
-        if ($row.Status -like "Success*") {
-            "{0} -> {1}" -f
-                $row.From.ToString("M/d/yyyy h:mm tt"),
-                $row.To.ToString("M/d/yyyy h:mm tt")
+            [PSCustomObject]@{
+                ID     = [string]$row.ID
+                Name   = [string]$row.Name
+                Status = [string]$row.Status
+                When   = [string]$when
+                Count  = [string]$row.Count
+            }
         }
-        elseif ($row.Status -like "Skipped (commented out in input)*") {
-            ""
-        }
-        elseif ($row.From -is [datetime]) {
-            "Last Azure: {0}" -f $row.From.ToString("M/d/yyyy h:mm tt")
-        }
-        else {
-            "Last Azure: unknown"
+
+        $maxCol = 60
+
+        $wID     = Get-MaxLen -Header "ID"                    -Values ($display.ID)     -Cap $maxCol
+        $wName   = Get-MaxLen -Header "Name"                  -Values ($display.Name)   -Cap $maxCol
+        $wStatus = Get-MaxLen -Header "Status"                -Values ($display.Status) -Cap $maxCol
+        $wWhen   = Get-MaxLen -Header "From / To / Last Azure" -Values ($display.When)   -Cap $maxCol
+        $wCount  = Get-MaxLen -Header "Count"                 -Values ($display.Count)  -Cap $maxCol
+
+        $fmt = "{0,$wID} {1,-$wName} {2,-$wStatus} {3,-$wWhen} {4,$wCount}"
+
+
+        # Headers
+        Write-Host ($fmt -f "ID","Name","Status","From / To / Last Azure","Count") -ForegroundColor Cyan
+        Write-Host ($fmt -f ("-"*$wID), ("-"*$wName), ("-"*$wStatus), ("-"*$wWhen), ("-"*$wCount)) -ForegroundColor Cyan
+
+        # Rows
+        foreach ($row in $Summary) {
+
+            $when =
+                if ($row.Status -like "Success*") {
+                    "{0} -> {1}" -f
+                        $row.From.ToString("M/d/yyyy h:mm tt"),
+                        $row.To.ToString("M/d/yyyy h:mm tt")
+                }
+                elseif ($row.Status -like "Skipped (commented out in input)*") {
+                    ""
+                }
+                elseif ($row.From -is [datetime]) {
+                    "Last Azure: {0}" -f $row.From.ToString("M/d/yyyy h:mm tt")
+                }
+                else {
+                    "Last Azure: unknown"
+                }
+
+            $color =
+                if ($row.Status -like "Success*") { "Green" }
+                elseif ($row.Status -like "Skipped (Up to date)*") { "DarkGray" }
+                elseif ($row.Status -like "Skipped (commented out in input)*") { "DarkGray" }
+                elseif ($row.Status -like "Skipped (No Files)*") { "Yellow" }
+                elseif ($row.Status -like "Failed*") { "Red" }
+                else { "White" }
+
+            Write-Host (
+                $fmt -f
+                    (Fit $row.ID     $wID),
+                    (Fit $row.Name   $wName),
+                    (Fit $row.Status $wStatus),
+                    (Fit $when       $wWhen),
+                    (Fit $row.Count  $wCount)
+            ) -ForegroundColor $color
         }
 
-    [PSCustomObject]@{
-        ID     = [string]$row.ID
-        Name   = [string]$row.Name
-        Status = [string]$row.Status
-        When   = [string]$when
-        Count  = [string]$row.Count
+        # Still write a clean, uncolored table to the log file
+        $Summary | Format-Table -AutoSize | Out-File $LogFile -Append
+
+        $ScriptEnd = Get-Date
+        $Duration = New-TimeSpan -Start $ScriptStart -End $ScriptEnd
+
+        Write-Host ""
+        Write-Host ("Script Start : {0}" -f $ScriptStart.ToString("yyyy-MM-dd HH:mm:ss")) -ForegroundColor Gray
+        Write-Host ("Script End   : {0}" -f $ScriptEnd.ToString("yyyy-MM-dd HH:mm:ss")) -ForegroundColor Gray
+        Write-Host ("Elapsed Time : {0:hh\:mm\:ss}" -f $Duration) -ForegroundColor Cyan
+
+        Add-Content -Path $LogFile -Value ""
+        Add-Content -Path $LogFile -Value ("Script Start : {0}" -f $ScriptStart)
+        Add-Content -Path $LogFile -Value ("Script End   : {0}" -f $ScriptEnd)
+        Add-Content -Path $LogFile -Value ("Elapsed Time : {0}" -f $Duration)
+    }
+    catch 
+    {
+      Write-Log ("Summary section failed: {0}" -f (Get-OneLineError $_)) "Red"
     }
 }
-
-$maxCol = 60
-
-$wID     = Get-MaxLen -Header "ID"                    -Values ($display.ID)     -Cap $maxCol
-$wName   = Get-MaxLen -Header "Name"                  -Values ($display.Name)   -Cap $maxCol
-$wStatus = Get-MaxLen -Header "Status"                -Values ($display.Status) -Cap $maxCol
-$wWhen   = Get-MaxLen -Header "From / To / Last Azure" -Values ($display.When)   -Cap $maxCol
-$wCount  = Get-MaxLen -Header "Count"                 -Values ($display.Count)  -Cap $maxCol
-
-$fmt = "{0,$wID} {1,-$wName} {2,-$wStatus} {3,-$wWhen} {4,$wCount}"
-
-
-# Headers
-Write-Host ($fmt -f "ID","Name","Status","From / To / Last Azure","Count") -ForegroundColor Cyan
-Write-Host ($fmt -f ("-"*$wID), ("-"*$wName), ("-"*$wStatus), ("-"*$wWhen), ("-"*$wCount)) -ForegroundColor Cyan
-
-# Rows
-foreach ($row in $Summary) {
-
-    $when =
-        if ($row.Status -like "Success*") {
-            "{0} -> {1}" -f
-                $row.From.ToString("M/d/yyyy h:mm tt"),
-                $row.To.ToString("M/d/yyyy h:mm tt")
-        }
-        elseif ($row.Status -like "Skipped (commented out in input)*") {
-            ""
-        }
-        elseif ($row.From -is [datetime]) {
-            "Last Azure: {0}" -f $row.From.ToString("M/d/yyyy h:mm tt")
-        }
-        else {
-            "Last Azure: unknown"
-        }
-
-    $color =
-        if ($row.Status -like "Success*") { "Green" }
-        elseif ($row.Status -like "Skipped (Up to date)*") { "DarkGray" }
-        elseif ($row.Status -like "Skipped (commented out in input)*") { "DarkGray" }
-        elseif ($row.Status -like "Skipped (No Files)*") { "Yellow" }
-        elseif ($row.Status -like "Failed*") { "Red" }
-        else { "White" }
-
-    Write-Host (
-        $fmt -f
-            (Fit $row.ID     $wID),
-            (Fit $row.Name   $wName),
-            (Fit $row.Status $wStatus),
-            (Fit $when       $wWhen),
-            (Fit $row.Count  $wCount)
-    ) -ForegroundColor $color
-}
-
-# Still write a clean, uncolored table to the log file
-$Summary | Format-Table -AutoSize | Out-File $LogFile -Append
-
-$ScriptEnd = Get-Date
-$Duration = New-TimeSpan -Start $ScriptStart -End $ScriptEnd
-
-Write-Host ""
-Write-Host ("Script Start : {0}" -f $ScriptStart.ToString("yyyy-MM-dd HH:mm:ss")) -ForegroundColor Gray
-Write-Host ("Script End   : {0}" -f $ScriptEnd.ToString("yyyy-MM-dd HH:mm:ss")) -ForegroundColor Gray
-Write-Host ("Elapsed Time : {0:hh\:mm\:ss}" -f $Duration) -ForegroundColor Cyan
-
-Add-Content -Path $LogFile -Value ""
-Add-Content -Path $LogFile -Value ("Script Start : {0}" -f $ScriptStart)
-Add-Content -Path $LogFile -Value ("Script End   : {0}" -f $ScriptEnd)
-Add-Content -Path $LogFile -Value ("Elapsed Time : {0}" -f $Duration)
