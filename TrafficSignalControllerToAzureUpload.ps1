@@ -201,9 +201,11 @@ try {
 
 # --- 3. PARSE IDS & LOAD CSV ---
 $SignalList = @()
-# Import from CSV file that could have comments 
+
+# Import from CSV file that could have comments
 $Headers = @("ID","Name","Switch","Controller","Battery")
 $MasterList = @()
+
 foreach ($line in Get-Content -Path $TrafficCsv) {
     if (-not $line) { continue }
     $t = $line.Trim()
@@ -231,6 +233,7 @@ foreach ($line in Get-Content -Path $TrafficCsv) {
         try {
             $obj = $t | ConvertFrom-Csv -Header $Headers
             $obj | Add-Member -NotePropertyName Excluded -NotePropertyValue $false -Force
+            $obj.ID = ($obj.ID -replace '\D', '')   # keep consistent with commented rows
             $MasterList += $obj
         } catch {
             # ignore malformed rows
@@ -244,29 +247,58 @@ foreach ($line in Get-Content -Path $TrafficCsv) {
 # Keep only rows with numeric IDs (active or excluded)
 $MasterList = $MasterList | Where-Object { $_.ID -match '^\d+$' }
 
+# --- CLI Override Set (IDs explicitly requested) ---
+$CliIDSet = $null
+
 # If $IDs provided, parse. Else use all from CSV.
 if (-not [string]::IsNullOrWhiteSpace($IDs)) {
+
     $RawIDs = @()
+
     # Parse "1, 3..5" syntax
     $Parts = $IDs -split ','
     foreach ($P in $Parts) {
         $Clean = $P.Trim()
         if ($Clean -match '(\d+)\.\.(\d+)') {
-            $Start=[int]$matches[1]; $End=[int]$matches[2]
+            $Start = [int]$matches[1]
+            $End   = [int]$matches[2]
+            # (PowerShell range handles Start > End too, but keep explicit)
             if ($Start -le $End) { $RawIDs += ($Start..$End) } else { $RawIDs += ($Start..$End) }
-        } elseif ($Clean -match '^\d+$') { $RawIDs += [int]$Clean }
+        } elseif ($Clean -match '^\d+$') {
+            $RawIDs += [int]$Clean
+        }
     }
+
     $RawIDs = $RawIDs | Select-Object -Unique | Sort-Object
-    
+
+    # Build fast lookup for "explicit CLI IDs"
+    $CliIDSet = @{}
+    foreach ($x in $RawIDs) { $CliIDSet[[int]$x] = $true }
+
+    # Build SignalList from CSV rows (including commented-out rows!)
     foreach ($RId in $RawIDs) {
-        $Found = $MasterList | Where-Object { [int]$_.ID -eq $RId }
+        $Found = $MasterList | Where-Object { [int]$_.ID -eq [int]$RId }
         if ($Found) { $SignalList += $Found }
+        else {
+            # OPTIONAL: if user types an ID not present in CSV at all,
+            # include a placeholder row so they get a clear "missing controller IP" skip later.
+            $SignalList += [PSCustomObject]@{
+                ID         = [string]$RId
+                Name       = "Unknown (not in CSV)"
+                Switch     = ""
+                Controller = ""
+                Battery    = ""
+                Excluded   = $false
+            }
+        }
     }
+
 } else {
     $SignalList = $MasterList
 }
 
 Write-Log "Processing $($SignalList.Count) signals..." "Cyan"
+
 
 # --- HELPER FUNCTIONS ---
 
@@ -478,13 +510,21 @@ function Is-From-Less-Or-Equal-ByHour {
 $Summary = @()
 
 foreach ($Sig in $SignalList) {
+
     # Validate ID
     if ($Sig.ID -notmatch '^\d+$') { Write-Log "Skipping invalid ID: $($Sig.ID)" "Yellow"; continue }
     $IDVal = [int]$Sig.ID
     if ($IDVal -lt 1 -or $IDVal -gt 999) { Write-Log "ID $IDVal out of range (1-999). Skipping." "Yellow"; continue }
-    
-    # CSV-commented signals: allow "#ID,..." (with optional whitespace) and show in summary
-    if ($Sig.PSObject.Properties.Match("Excluded").Count -gt 0 -and $Sig.Excluded) {
+
+    # --- CLI override vs CSV-commented row ---
+    $IsExcluded = ($Sig.PSObject.Properties.Match("Excluded").Count -gt 0 -and [bool]$Sig.Excluded)
+    $CliOverride = $false
+    if ($CliIDSet) {
+        try { $CliOverride = $CliIDSet.ContainsKey($IDVal) } catch { $CliOverride = $false }
+    }
+
+    # If excluded AND not explicitly requested, skip (original behavior)
+    if ($IsExcluded -and -not $CliOverride) {
         $Name = if ($Sig.Name) { $Sig.Name } else { "Unknown" }
         Write-Log "----------------------------------------------------------------" "Gray"
         Write-Log ("ID {0}: {1} skipped (commented out in input CSV)." -f $IDVal, $Name) "DarkGray"
@@ -499,9 +539,17 @@ foreach ($Sig in $SignalList) {
         continue
     }
 
+    # If excluded BUT CLI requested, process anyway
+    if ($IsExcluded -and $CliOverride) {
+        Write-Log ("NOTE: ID {0} is commented out in CSV, but processing anyway due to CLI override." -f $IDVal) "Yellow"
+    }
+
     $Name = if ($Sig.Name) { $Sig.Name } else { "Unknown" }
     Write-Log "----------------------------------------------------------------" "Gray"
     Write-Log "Processing ID ${IDVal}: $Name" "Cyan"
+
+    # (rest of your loop remains unchanged...)
+
 
 
     $SwitchIP = ("" + $Sig.Switch).Trim()   # safe for powershell 5.1
@@ -753,54 +801,110 @@ foreach ($Sig in $SignalList) {
     # get out of there to then be able to delete Statging area later
     Set-Location $ScriptHome 
     
-    # Step 7: Rename & Fix IP
-    $Csvs = Get-ChildItem -Path $StagingFolder -Filter "*.csv"
+    # Step 7: Normalize CSVs (rename + fix line1 + optional timezone fix)
+    $Csvs = Get-ChildItem -Path $StagingFolder -Filter "*.csv" -ErrorAction SilentlyContinue
+
     foreach ($C in $Csvs) {
-        # Filename: SIEM_10.x.x.x_YYYY... -> SIEM_192.168.ID.11_YYYY...
-        if ($C.Name -match "SIEM_.*_(\d{4}_\d{2}_\d{2}_\d{4})\.csv") {
-            $TS = $matches[1]
-            $FileYear=[int]$TS.Substring(0,4); $FileMonth=[int]$TS.Substring(5,2); $FileDay=[int]$TS.Substring(8,2); $FileHour=[int]$TS.Substring(11,2)
-            $FileDate = Get-Date -Year $FileYear -Month $FileMonth -Day $FileDay -Hour $FileHour -Minute 0 -Second 0 -Millisecond 0
-            
-            $NewName = "SIEM_192.168.$IDVal.11_$TS.csv"
-            $NewPath = Join-Path $StagingFolder $NewName
-            
-            $Content = Get-Content $C.FullName
-            if ($Content.Count -gt 2) {
-                # Fix Line 1
-                $Content[0] = "192.168.$IDVal.11,,"
-                
-                # Fix Timezones (Line 3+)
-                $HeaderLines = $Content[0..1]
-                $DataLines = $Content[2..($Content.Count-1)]
-                $UpdatedData = foreach ($Line in $DataLines) {
-                    if ([string]::IsNullOrWhiteSpace($Line)) { $Line; continue }
-                    $Cols = $Line -split ','
-                    try {
-                        $RowDt = [datetime]::ParseExact($Cols[0].Trim(), "MM-dd-yyyy HH:mm:ss.f", $null)
-                        $RowBucket = Get-Date -Year $RowDt.Year -Month $RowDt.Month -Day $RowDt.Day -Hour $RowDt.Hour -Minute 0 -Second 0 -Millisecond 0
-                        $Diff = $FileDate - $RowBucket; $HDiff = $Diff.TotalHours
-                        
-                        if ([Math]::Abs($HDiff) -ge 1 -and [Math]::Abs($HDiff) -le 7) {
-                            $NewDt = $RowDt.AddHours($HDiff)
-                            $Cols[0] = $NewDt.ToString("MM-dd-yyyy HH:mm:ss.f")
-                            $Cols -join ','
-                        } else { $Line }
-                    } catch { $Line }
+
+        # Expect: SIEM_<anything>_yyyy_MM_dd_HH00.csv
+        if ($C.Name -notmatch 'SIEM_.*_(\d{4}_\d{2}_\d{2}_\d{4})\.csv$') {
+            Write-Log "   WARNING: Unexpected CSV name, skipping: $($C.Name)" "Yellow"
+            continue
+        }
+
+        $TS = $matches[1]
+        $NewName = "SIEM_192.168.$IDVal.11_$TS.csv"
+        $NewPath = Join-Path $StagingFolder $NewName
+
+        # Read all lines safely
+        $Content = $null
+        try {
+            $Content = Get-Content -LiteralPath $C.FullName -ErrorAction Stop
+        } catch {
+            Write-Log ("   WARNING: Could not read CSV; deleting: {0} ({1})" -f $C.Name, (Get-OneLineError $_)) "Yellow"
+            Remove-TreeSafe -Path $C.FullName
+            continue
+        }
+
+        # If the translator produced an empty/garbage CSV, kill it so it cannot upload.
+        if ($null -eq $Content -or $Content.Count -lt 1) {
+            Write-Log "   WARNING: Empty/invalid CSV from translator; deleting: $($C.Name)" "Yellow"
+            Remove-TreeSafe -Path $C.FullName
+            continue
+        }
+
+        # Always fix Line 1 (even if file is short)
+        $Content[0] = "192.168.$IDVal.11,,"
+
+        # Only do timezone adjustment if we have at least 3 lines (your original logic)
+        if ($Content.Count -gt 2) {
+
+            # Parse file bucket date from TS
+            $FileYear  = [int]$TS.Substring(0,4)
+            $FileMonth = [int]$TS.Substring(5,2)
+            $FileDay   = [int]$TS.Substring(8,2)
+            $FileHour  = [int]$TS.Substring(11,2)
+            $FileDate  = Get-Date -Year $FileYear -Month $FileMonth -Day $FileDay -Hour $FileHour -Minute 0 -Second 0 -Millisecond 0
+
+            $HeaderLines = $Content[0..1]
+            $DataLines   = $Content[2..($Content.Count-1)]
+
+            $UpdatedData = foreach ($Line in $DataLines) {
+                if ([string]::IsNullOrWhiteSpace($Line)) { $Line; continue }
+
+                $Cols = $Line -split ','
+                try {
+                    $RowDt = [datetime]::ParseExact($Cols[0].Trim(), "MM-dd-yyyy HH:mm:ss.f", $null)
+                    $RowBucket = Get-Date -Year $RowDt.Year -Month $RowDt.Month -Day $RowDt.Day -Hour $RowDt.Hour -Minute 0 -Second 0 -Millisecond 0
+
+                    $Diff  = $FileDate - $RowBucket
+                    $HDiff = $Diff.TotalHours
+                    # usually if file content is on zulu time, HDiff will be +5 or +6 (CDT/CST)
+                    # only adjust if within reasonable range
+                    if ([Math]::Abs($HDiff) -ge 1 -and [Math]::Abs($HDiff) -le 7) {
+                        $NewDt = $RowDt.AddHours($HDiff)
+                        $Cols[0] = $NewDt.ToString("MM-dd-yyyy HH:mm:ss.f")
+                        $Cols -join ','
+                    } else {
+                        $Line
+                    }
+                } catch {
+                    $Line
                 }
-                
-                $Final = $HeaderLines + $UpdatedData
-                $Final | Set-Content $NewPath -Force
-                if ($NewName -ne $C.Name) { Remove-Item $C.FullName -Force }
             }
+
+            $Content = $HeaderLines + $UpdatedData
+        }
+        else {
+            # Too short to be a real dataset — treat as failed conversion; delete so it can't upload.
+            Write-Log "   WARNING: CSV has <3 lines (likely failed conversion); deleting: $($C.Name)" "Yellow"
+            Remove-TreeSafe -Path $C.FullName
+            continue
+        }
+
+        # Write normalized file (then delete old if different)
+        try {
+            $Content | Set-Content -LiteralPath $NewPath -Force
+
+            if ($NewPath -ne $C.FullName) {
+                Remove-TreeSafe -Path $C.FullName
+            }
+
+        } catch {
+            Write-Log ("   WARNING: Failed to write normalized CSV; deleting both: {0} ({1})" -f $C.Name, (Get-OneLineError $_)) "Yellow"
+            Remove-TreeSafe -Path $C.FullName
+            Remove-TreeSafe -Path $NewPath
+            continue
         }
     }
+
 
     # Step 8: Upload
     $AzCopyExe = Join-Path $ScriptHome "AzCopy.exe"
     $DestUrl = "https://cob77803.blob.core.windows.net/siglog"
     # --overwrite=true is key
-    $AzArgs = "copy `"$StagingFolder\*.csv`" `"$DestUrl`" --overwrite=true --block-blob-tier=Cool --log-level=ERROR"
+    # This will tightly match only the files for this signal ID, prevents the “SIEM_10.105…” files from ever going up to Azure Cloud, even if something slips.
+    $AzArgs = "copy `"$StagingFolder\SIEM_192.168.$IDVal.11_*.csv`" `"$DestUrl`" --overwrite=true --block-blob-tier=Cool --log-level=ERROR"
     $Proc = Start-Process -FilePath $AzCopyExe -ArgumentList $AzArgs -NoNewWindow -PassThru -Wait
     
     if ($Proc.ExitCode -eq 0) {
